@@ -28,15 +28,18 @@ services:
       RESIN_PLATFORM: AppsGlobal
       STATE_PATH: /data/state.json
       MAX_ATTEMPTS: "3"
+      MAX_IN_FLIGHT: "4"
+      MAX_QUEUE_WAIT: 30s
       MAX_REQUEST_BODY_BYTES: "8388608"
       MAX_RESPONSE_BODY_BYTES: "8388608"
       RESPONSE_HEADER_TIMEOUT: 30s
       FIRST_BYTE_TIMEOUT: 30s
+      RESPONSE_BUFFER_TIMEOUT: 2m
       MAX_RETRY_AFTER: 3s
       ROUTE_STATE_TTL: 720h
       ALLOW_HTTP_TARGETS: "false"
       ALLOW_PRIVATE_TARGETS: "false"
-    mem_limit: 96m
+    mem_limit: 160m
     cpus: 0.50
     labels:
       - "com.centurylinklabs.watchtower.enable=true"

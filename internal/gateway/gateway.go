@@ -33,6 +33,10 @@ const (
 	resinAccountHeader       = "X-Resin-Account"
 	resinErrorHeader         = "X-Resin-Error"
 	maxTargetHeaderBytes     = 16 << 10
+	defaultMaxInFlight       = 4
+	defaultMaxQueueWait      = 30 * time.Second
+	defaultBufferTimeout     = 2 * time.Minute
+	targetLookupTimeout      = 2 * time.Second
 )
 
 type retryMode uint8
@@ -51,14 +55,17 @@ type Metrics struct {
 	authRejected   atomic.Uint64
 	bodyRejected   atomic.Uint64
 	targetRejected atomic.Uint64
+	queueRejected  atomic.Uint64
 }
 
 type Gateway struct {
-	cfg     Config
-	state   *StateStore
-	client  *http.Client
-	logger  *slog.Logger
-	metrics Metrics
+	cfg      Config
+	state    *StateStore
+	client   *http.Client
+	logger   *slog.Logger
+	inFlight chan struct{}
+	lookupIP func(context.Context, string) ([]netip.Addr, error)
+	metrics  Metrics
 }
 
 func New(cfg Config, state *StateStore, logger *slog.Logger) *Gateway {
@@ -76,11 +83,24 @@ func New(cfg Config, state *StateStore, logger *slog.Logger) *Gateway {
 		ExpectContinueTimeout: time.Second,
 		DisableCompression:    true,
 	}
+	if cfg.MaxInFlight <= 0 {
+		cfg.MaxInFlight = defaultMaxInFlight
+	}
+	if cfg.MaxQueueWait <= 0 {
+		cfg.MaxQueueWait = defaultMaxQueueWait
+	}
+	if cfg.ResponseBufferTimeout <= 0 {
+		cfg.ResponseBufferTimeout = defaultBufferTimeout
+	}
 	return &Gateway{
-		cfg:    cfg,
-		state:  state,
-		client: &http.Client{Transport: transport},
-		logger: logger,
+		cfg:      cfg,
+		state:    state,
+		client:   &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		logger:   logger,
+		inFlight: make(chan struct{}, cfg.MaxInFlight),
+		lookupIP: func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		},
 	}
 }
 
@@ -115,6 +135,7 @@ func (g *Gateway) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeMetric("auth_rejected_total", g.metrics.authRejected.Load())
 	writeMetric("body_rejected_total", g.metrics.bodyRejected.Load())
 	writeMetric("target_rejected_total", g.metrics.targetRejected.Load())
+	writeMetric("queue_rejected_total", g.metrics.queueRejected.Load())
 }
 
 func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
@@ -125,12 +146,21 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.metrics.requests.Add(1)
+	if !g.acquire(r.Context()) {
+		g.metrics.queueRejected.Add(1)
+		if r.Context().Err() == nil {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "gateway busy", http.StatusServiceUnavailable)
+		}
+		return
+	}
+	defer g.release()
 	if r.Method == http.MethodConnect || strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		g.metrics.targetRejected.Add(1)
 		http.Error(w, "CONNECT and protocol upgrades are not supported", http.StatusNotImplemented)
 		return
 	}
-	target, err := g.parseTarget(r.Header.Get(targetHeader))
+	target, err := g.parseTarget(r.Context(), r.Header.Get(targetHeader))
 	if err != nil {
 		g.metrics.targetRejected.Add(1)
 		http.Error(w, "invalid target", http.StatusBadRequest)
@@ -195,7 +225,9 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 				g.logger.Warn("downstream delivery failed", "route", shortRoute(routeID), "host", target.Hostname(), "attempt", attempt, "error", errorClass(err))
 				return
 			}
-			_ = g.state.Touch(routeID, generation)
+			if touchErr := g.state.Touch(routeID, generation); touchErr != nil {
+				g.logger.Warn("state touch failed", "route", shortRoute(routeID), "error", errorClass(touchErr))
+			}
 			g.metrics.successes.Add(1)
 			g.logger.Info("request completed", "route", shortRoute(routeID), "host", target.Hostname(), "method", r.Method, "status", result.response.StatusCode, "attempts", attempt, "generation", generation, "elapsed_ms", time.Since(started).Milliseconds())
 			return
@@ -308,7 +340,7 @@ func (g *Gateway) performAttempt(parent context.Context, method string, inboundH
 		result.streaming = true
 		return result
 	}
-	rest, readErr := readBufferedResponse(ctx, cancel, resp.Body, remaining+1, firstByteTimeout)
+	rest, readErr := readBufferedResponse(ctx, cancel, resp.Body, remaining+1, g.cfg.ResponseBufferTimeout)
 	if readErr != nil {
 		result.err = readErr
 		result.retry = parent.Err() == nil && isRetryableTransportError(readErr)
@@ -404,7 +436,7 @@ func (g *Gateway) authorized(r *http.Request) bool {
 	return len(provided) == len(g.cfg.AuthToken) && subtle.ConstantTimeCompare([]byte(provided), []byte(g.cfg.AuthToken)) == 1
 }
 
-func (g *Gateway) parseTarget(encoded string) (*url.URL, error) {
+func (g *Gateway) parseTarget(parent context.Context, encoded string) (*url.URL, error) {
 	if encoded == "" || len(encoded) > maxTargetHeaderBytes*2 {
 		return nil, errors.New("missing target")
 	}
@@ -419,10 +451,50 @@ func (g *Gateway) parseTarget(encoded string) (*url.URL, error) {
 	if target.Scheme != "https" && !(g.cfg.AllowHTTP && target.Scheme == "http") {
 		return nil, errors.New("target scheme is not allowed")
 	}
-	if !g.cfg.AllowPrivateTargets && forbiddenTargetHost(target.Hostname()) {
-		return nil, errors.New("target host is not allowed")
+	if !g.cfg.AllowPrivateTargets {
+		if err := g.validateTargetHost(parent, target.Hostname()); err != nil {
+			return nil, err
+		}
 	}
 	return target, nil
+}
+
+func (g *Gateway) validateTargetHost(parent context.Context, host string) error {
+	if forbiddenTargetHost(host) {
+		return errors.New("target host is not allowed")
+	}
+	if _, err := netip.ParseAddr(strings.TrimSuffix(host, ".")); err == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(parent, targetLookupTimeout)
+	defer cancel()
+	addresses, err := g.lookupIP(ctx, host)
+	if err != nil || len(addresses) == 0 {
+		return errors.New("target host could not be resolved")
+	}
+	for _, address := range addresses {
+		if forbiddenTargetAddress(address) {
+			return errors.New("target host resolves to a disallowed address")
+		}
+	}
+	return nil
+}
+
+func (g *Gateway) acquire(ctx context.Context) bool {
+	timer := time.NewTimer(g.cfg.MaxQueueWait)
+	defer timer.Stop()
+	select {
+	case g.inFlight <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+func (g *Gateway) release() {
+	<-g.inFlight
 }
 
 func (g *Gateway) buildResinURL(target *url.URL) string {
@@ -657,13 +729,19 @@ func waitForRetry(ctx context.Context, requested time.Duration, attempt int) boo
 
 func forbiddenTargetHost(host string) bool {
 	normalized := strings.ToLower(strings.TrimSuffix(host, "."))
-	if normalized == "localhost" || strings.HasSuffix(normalized, ".localhost") || strings.HasSuffix(normalized, ".local") {
+	if normalized == "localhost" || normalized == "proxy.internal" || normalized == "host.docker.internal" ||
+		strings.HasSuffix(normalized, ".localhost") || strings.HasSuffix(normalized, ".local") || strings.HasSuffix(normalized, ".internal") {
 		return true
 	}
 	address, err := netip.ParseAddr(normalized)
 	if err != nil {
 		return false
 	}
+	return forbiddenTargetAddress(address)
+}
+
+func forbiddenTargetAddress(address netip.Addr) bool {
+	address = address.Unmap()
 	if address.IsLoopback() || address.IsPrivate() || address.IsUnspecified() || address.IsMulticast() || address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() {
 		return true
 	}
@@ -701,7 +779,8 @@ func copyRequestHeaders(dst, src http.Header) {
 	connectionTokens := headerTokens(src.Get("Connection"))
 	for key, values := range src {
 		canonical := http.CanonicalHeaderKey(key)
-		if _, skip := hopByHopHeaders[canonical]; skip || connectionTokens[canonical] || strings.HasPrefix(strings.ToLower(canonical), "x-egress-") || canonical == resinAccountHeader {
+		lower := strings.ToLower(canonical)
+		if _, skip := hopByHopHeaders[canonical]; skip || connectionTokens[canonical] || strings.HasPrefix(lower, "x-egress-") || strings.HasPrefix(lower, "x-resin-") {
 			continue
 		}
 		for _, value := range values {
@@ -714,7 +793,8 @@ func copyResponseHeaders(dst, src http.Header) {
 	connectionTokens := headerTokens(src.Get("Connection"))
 	for key, values := range src {
 		canonical := http.CanonicalHeaderKey(key)
-		if _, skip := hopByHopHeaders[canonical]; skip || connectionTokens[canonical] || canonical == attemptsResponseHeader || canonical == generationResponseHeader {
+		lower := strings.ToLower(canonical)
+		if _, skip := hopByHopHeaders[canonical]; skip || connectionTokens[canonical] || strings.HasPrefix(lower, "x-egress-") || strings.HasPrefix(lower, "x-resin-") {
 			continue
 		}
 		for _, value := range values {

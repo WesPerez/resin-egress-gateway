@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -38,8 +39,11 @@ func newTestGateway(t *testing.T, resin http.Handler) (*Gateway, *httptest.Serve
 		MaxRequestBodyBytes:   1024,
 		MaxResponseBodyBytes:  1024,
 		MaxAttempts:           3,
+		MaxInFlight:           4,
+		MaxQueueWait:          100 * time.Millisecond,
 		ResponseHeaderTimeout: 200 * time.Millisecond,
 		FirstByteTimeout:      200 * time.Millisecond,
+		ResponseBufferTimeout: 200 * time.Millisecond,
 		MaxRetryAfter:         10 * time.Millisecond,
 		RouteStateTTL:         24 * time.Hour,
 		AllowHTTP:             true,
@@ -126,12 +130,17 @@ func TestResinReverseURLAndSensitiveHeadersArePreserved(t *testing.T) {
 	var authorization string
 	var cookie string
 	var leakedControl string
+	var leakedResinControl string
+	var generatedIdentity string
 	gateway, _ := newTestGateway(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		escapedPath = r.URL.EscapedPath()
 		rawQuery = r.URL.RawQuery
 		authorization = r.Header.Get("Authorization")
 		cookie = r.Header.Get("Cookie")
 		leakedControl = r.Header.Get(targetHeader)
+		leakedResinControl = r.Header.Get("X-Resin-Injected")
+		generatedIdentity = r.Header.Get(resinAccountHeader)
+		w.Header().Set(resinErrorHeader, "AUTH_FAILED")
 		_, _ = io.WriteString(w, "ok")
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/v1/forward", nil)
@@ -140,6 +149,8 @@ func TestResinReverseURLAndSensitiveHeadersArePreserved(t *testing.T) {
 	req.Header.Set(keyHeader, "account")
 	req.Header.Set("Authorization", "Bearer upstream-secret")
 	req.Header.Set("Cookie", "session=secret")
+	req.Header.Set(resinAccountHeader, "attacker-controlled")
+	req.Header.Set("X-Resin-Injected", "attacker-controlled")
 	recorder := httptest.NewRecorder()
 	gateway.Handler().ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
@@ -156,6 +167,33 @@ func TestResinReverseURLAndSensitiveHeadersArePreserved(t *testing.T) {
 	}
 	if leakedControl != "" {
 		t.Fatalf("Gateway control header leaked: %q", leakedControl)
+	}
+	if leakedResinControl != "" || generatedIdentity == "attacker-controlled" || generatedIdentity == "" {
+		t.Fatalf("Resin controls were not isolated: leaked=%q identity=%q", leakedResinControl, generatedIdentity)
+	}
+	if recorder.Header().Get(resinErrorHeader) != "" {
+		t.Fatalf("Resin response control leaked: %q", recorder.Header().Get(resinErrorHeader))
+	}
+}
+
+func TestRedirectIsReturnedWithoutDirectFollow(t *testing.T) {
+	var directCalls atomic.Int32
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		directCalls.Add(1)
+		_, _ = io.WriteString(w, "should not be reached")
+	}))
+	t.Cleanup(direct.Close)
+
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", direct.URL+"/redirected")
+		w.WriteHeader(http.StatusFound)
+	}))
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://service.test/start", "redirect-key", "safe", nil)
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("redirect status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if directCalls.Load() != 0 {
+		t.Fatalf("redirect target was followed directly %d times", directCalls.Load())
 	}
 }
 
@@ -175,6 +213,36 @@ func TestSafeRetriesStatusesButTransportDoesNot(t *testing.T) {
 	safe := forwardRequest(t, gateway.Handler(), http.MethodPost, "http://service.test/checkin", "safe-key", "safe", []byte("{}"))
 	if safe.Code != http.StatusServiceUnavailable || calls.Load() != 3 {
 		t.Fatalf("safe mode status/calls = %d/%d", safe.Code, calls.Load())
+	}
+}
+
+func TestAutoPostAndNeverModeDoNotRetry(t *testing.T) {
+	var calls atomic.Int32
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+	}))
+
+	autoPost := forwardRequest(t, gateway.Handler(), http.MethodPost, "http://service.test/checkin", "auto-post", "", []byte("{}"))
+	if autoPost.Code != http.StatusServiceUnavailable || calls.Load() != 1 {
+		t.Fatalf("auto POST status/calls = %d/%d", autoPost.Code, calls.Load())
+	}
+
+	calls.Store(0)
+	neverGet := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://service.test/data", "never-get", "never", nil)
+	if neverGet.Code != http.StatusServiceUnavailable || calls.Load() != 1 {
+		t.Fatalf("never GET status/calls = %d/%d", neverGet.Code, calls.Load())
+	}
+}
+
+func TestRetryAfterIsBounded(t *testing.T) {
+	maximum := 25 * time.Millisecond
+	if got := retryAfter("120", maximum); got != maximum {
+		t.Fatalf("seconds Retry-After = %s", got)
+	}
+	future := time.Now().Add(5 * time.Second).UTC().Format(http.TimeFormat)
+	if got := retryAfter(future, maximum); got <= 0 || got > maximum {
+		t.Fatalf("date Retry-After = %s", got)
 	}
 }
 
@@ -212,6 +280,32 @@ func TestFirstByteTimeoutRetriesBeforeCommit(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "ready") {
 		t.Fatalf("unexpected body: %s", recorder.Body.String())
+	}
+}
+
+func TestResponseBufferTimeoutRetriesBeforeCommit(t *testing.T) {
+	var calls atomic.Int32
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		current := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ready":`)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		if current < 3 {
+			time.Sleep(80 * time.Millisecond)
+			return
+		}
+		_, _ = io.WriteString(w, `true}`)
+	}))
+	gateway.cfg.ResponseBufferTimeout = 20 * time.Millisecond
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://service.test/data", "slow-body", "transport", nil)
+	if recorder.Code != http.StatusOK || calls.Load() != 3 {
+		t.Fatalf("status/calls = %d/%d body=%s", recorder.Code, calls.Load(), recorder.Body.String())
+	}
+	if recorder.Body.String() != `{"ready":true}` {
+		t.Fatalf("unexpected body: %q", recorder.Body.String())
 	}
 }
 
@@ -280,5 +374,88 @@ func TestPrivateTargetRejectedByDefault(t *testing.T) {
 	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://127.0.0.1/admin", "key", "never", nil)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("private target status = %d", recorder.Code)
+	}
+}
+
+func TestIPv4MappedPrivateTargetIsRejected(t *testing.T) {
+	baseURL, _ := url.Parse("http://127.0.0.1:1")
+	state, err := NewStateStore(filepath.Join(t.TempDir(), "state.json"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := New(Config{
+		AuthToken: "gateway-secret", ResinBaseURL: baseURL, ResinProxyToken: "resin", ResinPlatform: "AppsGlobal",
+		MaxRequestBodyBytes: 1024, MaxResponseBodyBytes: 1024, MaxAttempts: 1,
+		ResponseHeaderTimeout: time.Second, FirstByteTimeout: time.Second, RouteStateTTL: time.Hour,
+		AllowHTTP: true, AllowPrivateTargets: false,
+	}, state, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://[::ffff:127.0.0.1]/admin", "key", "never", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("IPv4-mapped private target status = %d", recorder.Code)
+	}
+}
+
+func TestHostnameResolvingToPrivateTargetIsRejected(t *testing.T) {
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("Resin should not be called")
+	}))
+	gateway.cfg.AllowPrivateTargets = false
+	gateway.lookupIP = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://public-looking.example/admin", "key", "never", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("private DNS target status = %d", recorder.Code)
+	}
+}
+
+func TestInternalTargetNamesAreRejectedWithoutLookup(t *testing.T) {
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("Resin should not be called")
+	}))
+	gateway.cfg.AllowPrivateTargets = false
+	gateway.lookupIP = func(context.Context, string) ([]netip.Addr, error) {
+		t.Fatal("internal target should be rejected before DNS lookup")
+		return nil, nil
+	}
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://proxy.internal/admin", "key", "never", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("internal target status = %d", recorder.Code)
+	}
+}
+
+func TestConcurrencyQueueIsBounded(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		entered <- struct{}{}
+		<-release
+		_, _ = io.WriteString(w, "ok")
+	}))
+	gateway.inFlight = make(chan struct{}, 1)
+	gateway.cfg.MaxQueueWait = 20 * time.Millisecond
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- forwardRequest(t, gateway.Handler(), http.MethodGet, "http://service.test/first", "first", "never", nil)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not enter Resin")
+	}
+
+	second := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://service.test/second", "second", "never", nil)
+	if second.Code != http.StatusServiceUnavailable || second.Header().Get("Retry-After") != "1" {
+		t.Fatalf("queued request status/retry-after = %d/%q", second.Code, second.Header().Get("Retry-After"))
+	}
+	close(release)
+	select {
+	case first := <-firstDone:
+		if first.Code != http.StatusOK {
+			t.Fatalf("first request status = %d", first.Code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first request did not complete")
 	}
 }

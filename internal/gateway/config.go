@@ -25,8 +25,11 @@ type Config struct {
 	MaxRequestBodyBytes   int64
 	MaxResponseBodyBytes  int64
 	MaxAttempts           int
+	MaxInFlight           int
+	MaxQueueWait          time.Duration
 	ResponseHeaderTimeout time.Duration
 	FirstByteTimeout      time.Duration
+	ResponseBufferTimeout time.Duration
 	MaxRetryAfter         time.Duration
 	RouteStateTTL         time.Duration
 	AllowHTTP             bool
@@ -62,8 +65,11 @@ func LoadConfig() (Config, error) {
 		MaxRequestBodyBytes:   envInt64("MAX_REQUEST_BODY_BYTES", defaultMaxRequestBody),
 		MaxResponseBodyBytes:  envInt64("MAX_RESPONSE_BODY_BYTES", defaultMaxResponseBody),
 		MaxAttempts:           envInt("MAX_ATTEMPTS", 3),
+		MaxInFlight:           envInt("MAX_IN_FLIGHT", 4),
+		MaxQueueWait:          envDuration("MAX_QUEUE_WAIT", 30*time.Second),
 		ResponseHeaderTimeout: envDuration("RESPONSE_HEADER_TIMEOUT", 30*time.Second),
 		FirstByteTimeout:      envDuration("FIRST_BYTE_TIMEOUT", 30*time.Second),
+		ResponseBufferTimeout: envDuration("RESPONSE_BUFFER_TIMEOUT", 2*time.Minute),
 		MaxRetryAfter:         envDuration("MAX_RETRY_AFTER", 3*time.Second),
 		RouteStateTTL:         envDuration("ROUTE_STATE_TTL", 30*24*time.Hour),
 		AllowHTTP:             envBool("ALLOW_HTTP_TARGETS", false),
@@ -74,6 +80,12 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.MaxAttempts < 1 || cfg.MaxAttempts > 5 {
 		return Config{}, fmt.Errorf("MAX_ATTEMPTS must be between 1 and 5")
+	}
+	if cfg.MaxInFlight < 1 || cfg.MaxInFlight > 64 {
+		return Config{}, fmt.Errorf("MAX_IN_FLIGHT must be between 1 and 64")
+	}
+	if cfg.MaxQueueWait < time.Second || cfg.MaxQueueWait > 5*time.Minute {
+		return Config{}, fmt.Errorf("MAX_QUEUE_WAIT must be between 1s and 5m")
 	}
 	if cfg.MaxRequestBodyBytes < 1 || cfg.MaxRequestBodyBytes > 128<<20 {
 		return Config{}, fmt.Errorf("MAX_REQUEST_BODY_BYTES must be between 1 and 128 MiB")
@@ -86,6 +98,9 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.FirstByteTimeout < time.Second || cfg.FirstByteTimeout > 10*time.Minute {
 		return Config{}, fmt.Errorf("FIRST_BYTE_TIMEOUT must be between 1s and 10m")
+	}
+	if cfg.ResponseBufferTimeout < time.Second || cfg.ResponseBufferTimeout > 15*time.Minute {
+		return Config{}, fmt.Errorf("RESPONSE_BUFFER_TIMEOUT must be between 1s and 15m")
 	}
 	if cfg.MaxRetryAfter < 0 || cfg.MaxRetryAfter > time.Minute {
 		return Config{}, fmt.Errorf("MAX_RETRY_AFTER must be between 0 and 1m")
