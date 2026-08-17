@@ -409,6 +409,47 @@ func TestHostnameResolvingToPrivateTargetIsRejected(t *testing.T) {
 	}
 }
 
+func TestHostnameWithMixedPublicAndPrivateAnswersIsRejected(t *testing.T) {
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("Resin should not be called")
+	}))
+	gateway.cfg.AllowPrivateTargets = false
+	gateway.lookupIP = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{
+			netip.MustParseAddr("93.184.216.34"),
+			netip.MustParseAddr("10.0.0.8"),
+		}, nil
+	}
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://mixed.example/data", "key", "never", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("mixed DNS target status = %d", recorder.Code)
+	}
+}
+
+func TestRetryRevalidatesHostnameBeforeUsingNextIdentity(t *testing.T) {
+	var resinCalls atomic.Int32
+	var lookups atomic.Int32
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resinCalls.Add(1)
+		w.Header().Set(resinErrorHeader, "UPSTREAM_REQUEST_FAILED")
+		http.Error(w, "failed", http.StatusBadGateway)
+	}))
+	gateway.cfg.AllowPrivateTargets = false
+	gateway.lookupIP = func(context.Context, string) ([]netip.Addr, error) {
+		if lookups.Add(1) == 1 {
+			return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+		}
+		return []netip.Addr{netip.MustParseAddr("10.0.0.8")}, nil
+	}
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://rebind.example/data", "key", "transport", nil)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("rebind status = %d", recorder.Code)
+	}
+	if resinCalls.Load() != 1 || lookups.Load() != 2 {
+		t.Fatalf("Resin calls/lookups = %d/%d", resinCalls.Load(), lookups.Load())
+	}
+}
+
 func TestInternalTargetNamesAreRejectedWithoutLookup(t *testing.T) {
 	gateway, _ := newTestGateway(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("Resin should not be called")
@@ -457,5 +498,10 @@ func TestConcurrencyQueueIsBounded(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("first request did not complete")
+	}
+
+	third := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://service.test/third", "third", "never", nil)
+	if third.Code != http.StatusOK {
+		t.Fatalf("released slot did not accept third request: %d", third.Code)
 	}
 }

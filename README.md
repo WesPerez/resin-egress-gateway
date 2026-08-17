@@ -8,12 +8,13 @@
 
 - 总计默认最多 3 次尝试，每次失败推进一个持久化 `generation`，成功身份会被后续请求继续使用。
 - 请求体默认最多 8 MiB，普通响应默认在 8 MiB 内完整缓冲；超过上限的响应转为流式透传。
+- 普通响应首字后最多缓冲 2 分钟；超时发生在下游尚未提交响应时，可按所选 retry mode 换身份重试。
 - 默认最多同时处理 4 个请求；额外请求最多排队 30 秒，避免请求与响应缓冲耗尽容器内存。
 - SSE、NDJSON 和 JSON sequence 只等待首个 body 字节。首字一旦写给调用方，后续中断不会重放。
 - 默认策略：GET/HEAD/OPTIONS/PUT/DELETE 或携带 `Idempotency-Key` 的请求可对临时状态码重试；其他非幂等请求默认不重试。
 - 调用方可以显式选择 `transport`，用于签到等业务上可重复、但没有标准幂等键的 POST。
 - 不支持 CONNECT、WebSocket upgrade、TLS MITM 或直连 fallback。
-- 不跟随上游重定向；`Location` 原样返回调用方。默认拒绝字面或 DNS 解析到私网、环回、链路本地和保留地址的目标。
+- 不跟随上游重定向；`Location` 原样返回调用方。默认在首次请求及每次重试前拒绝本机 DNS 解析到私网、环回、链路本地和保留地址的目标；这是内部 SSRF 门禁，不会固定 Resin 侧的 DNS 解析结果。
 - 日志只记录 method、目标 hostname、短 route hash、状态、attempt 和耗时；不记录 Cookie、Authorization、URL query 或 body。
 
 ## 内部协议
