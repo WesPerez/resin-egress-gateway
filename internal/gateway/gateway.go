@@ -475,8 +475,18 @@ func (g *Gateway) validateTargetHost(parent context.Context, host string) error 
 	ctx, cancel := context.WithTimeout(parent, targetLookupTimeout)
 	defer cancel()
 	addresses, err := g.lookupIP(ctx, host)
-	if err != nil || len(addresses) == 0 {
-		return errors.New("target host could not be resolved")
+	if err != nil {
+		var dnsErr *net.DNSError
+		if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+			return errors.New("target host could not be resolved")
+		}
+	}
+	if len(addresses) == 0 {
+		// Resin resolves the target from the selected egress node. Local DNS can
+		// legitimately differ (or have no records), so an authoritative no-answer must
+		// not prevent Resin from trying the request. Literal and resolved private
+		// addresses are still rejected above and below.
+		return nil
 	}
 	for _, address := range addresses {
 		if forbiddenTargetAddress(address) {

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -426,6 +427,61 @@ func TestHostnameWithMixedPublicAndPrivateAnswersIsRejected(t *testing.T) {
 	}
 }
 
+func TestNXDomainHostnameIsDelegatedToResin(t *testing.T) {
+	var resinCalls atomic.Int32
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resinCalls.Add(1)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	gateway.cfg.AllowPrivateTargets = false
+	gateway.lookupIP = func(context.Context, string) ([]netip.Addr, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "egress-only.example", IsNotFound: true}
+	}
+
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://egress-only.example/data", "key", "never", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unresolved target status = %d", recorder.Code)
+	}
+	if resinCalls.Load() != 1 {
+		t.Fatalf("Resin calls = %d", resinCalls.Load())
+	}
+}
+
+func TestHostnameWithoutAddressRecordsIsDelegatedToResin(t *testing.T) {
+	var resinCalls atomic.Int32
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resinCalls.Add(1)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	gateway.cfg.AllowPrivateTargets = false
+	gateway.lookupIP = func(context.Context, string) ([]netip.Addr, error) {
+		return nil, nil
+	}
+
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://no-addresses.example/data", "key", "never", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("no-address target status = %d", recorder.Code)
+	}
+	if resinCalls.Load() != 1 {
+		t.Fatalf("Resin calls = %d", resinCalls.Load())
+	}
+}
+
+func TestTargetDNSFailureIsRejected(t *testing.T) {
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("Resin should not be called")
+	}))
+	gateway.cfg.AllowPrivateTargets = false
+	gateway.lookupIP = func(context.Context, string) ([]netip.Addr, error) {
+		return nil, &net.DNSError{Err: "i/o timeout", Name: "resolver-failure.example", IsTimeout: true, IsTemporary: true}
+	}
+
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://resolver-failure.example/data", "key", "never", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("DNS failure target status = %d", recorder.Code)
+	}
+}
+
 func TestRetryRevalidatesHostnameBeforeUsingNextIdentity(t *testing.T) {
 	var resinCalls atomic.Int32
 	var lookups atomic.Int32
@@ -441,6 +497,31 @@ func TestRetryRevalidatesHostnameBeforeUsingNextIdentity(t *testing.T) {
 		}
 		return []netip.Addr{netip.MustParseAddr("10.0.0.8")}, nil
 	}
+	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://rebind.example/data", "key", "transport", nil)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("rebind status = %d", recorder.Code)
+	}
+	if resinCalls.Load() != 1 || lookups.Load() != 2 {
+		t.Fatalf("Resin calls/lookups = %d/%d", resinCalls.Load(), lookups.Load())
+	}
+}
+
+func TestRetryRejectsDelegatedHostnameThatBecomesPrivate(t *testing.T) {
+	var resinCalls atomic.Int32
+	var lookups atomic.Int32
+	gateway, _ := newTestGateway(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resinCalls.Add(1)
+		w.Header().Set(resinErrorHeader, "UPSTREAM_REQUEST_FAILED")
+		http.Error(w, "failed", http.StatusBadGateway)
+	}))
+	gateway.cfg.AllowPrivateTargets = false
+	gateway.lookupIP = func(context.Context, string) ([]netip.Addr, error) {
+		if lookups.Add(1) == 1 {
+			return nil, &net.DNSError{Err: "no such host", Name: "rebind.example", IsNotFound: true}
+		}
+		return []netip.Addr{netip.MustParseAddr("10.0.0.8")}, nil
+	}
+
 	recorder := forwardRequest(t, gateway.Handler(), http.MethodGet, "http://rebind.example/data", "key", "transport", nil)
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("rebind status = %d", recorder.Code)

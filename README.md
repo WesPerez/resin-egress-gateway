@@ -14,7 +14,7 @@
 - 默认策略：GET/HEAD/OPTIONS/PUT/DELETE 或携带 `Idempotency-Key` 的请求可对临时状态码重试；其他非幂等请求默认不重试。
 - 调用方可以显式选择 `transport`，用于签到等业务上可重复、但没有标准幂等键的 POST。
 - 不支持 CONNECT、WebSocket upgrade、TLS MITM 或直连 fallback。
-- 不跟随上游重定向；`Location` 原样返回调用方。默认在首次请求及每次重试前拒绝本机 DNS 解析到私网、环回、链路本地和保留地址的目标；这是内部 SSRF 门禁，不会固定 Resin 侧的 DNS 解析结果。
+- 不跟随上游重定向；`Location` 原样返回调用方。默认在首次请求及每次重试前拒绝显式私网目标，以及本机 DNS 已解析到私网、环回、链路本地和保留地址的目标。本机 DNS 权威返回无记录时交给 Resin 出口解析，因为实际连接与 DNS 均发生在所选节点；DNS 超时或解析器故障仍拒绝。这是内部 SSRF 门禁，不会固定 Resin 侧的 DNS 解析结果。
 - 日志只记录 method、目标 hostname、短 route hash、状态、attempt 和耗时；不记录 Cookie、Authorization、URL query 或 body。
 
 ## 内部协议
