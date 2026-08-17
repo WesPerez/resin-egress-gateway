@@ -1,0 +1,47 @@
+name: resin-egress-gateway
+
+services:
+  gateway:
+    image: ${GATEWAY_IMAGE:-ghcr.io/wesperez/resin-egress-gateway:main}
+    container_name: resin-egress-gateway
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    extra_hosts:
+      - "proxy.internal:host-gateway"
+    ports:
+      - "127.0.0.1:19086:8080"
+    networks:
+      - metapi
+    volumes:
+      - ./data:/data
+      - /etc/resin-egress-gateway/gateway.token:/run/secrets/gateway.token:ro
+      - /etc/resin-egress-gateway/resin-proxy.token:/run/secrets/resin-proxy.token:ro
+    environment:
+      LISTEN_ADDRESS: ":8080"
+      GATEWAY_TOKEN_FILE: /run/secrets/gateway.token
+      RESIN_BASE_URL: http://proxy.internal:10834
+      RESIN_PROXY_TOKEN_FILE: /run/secrets/resin-proxy.token
+      RESIN_PLATFORM: AppsGlobal
+      STATE_PATH: /data/state.json
+      MAX_ATTEMPTS: "3"
+      MAX_REQUEST_BODY_BYTES: "8388608"
+      MAX_RESPONSE_BODY_BYTES: "8388608"
+      RESPONSE_HEADER_TIMEOUT: 30s
+      FIRST_BYTE_TIMEOUT: 30s
+      MAX_RETRY_AFTER: 3s
+      ROUTE_STATE_TTL: 720h
+      ALLOW_HTTP_TARGETS: "false"
+      ALLOW_PRIVATE_TARGETS: "false"
+    mem_limit: 96m
+    cpus: 0.50
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+networks:
+  metapi:
+    external: true
+    name: metapi-deploy_default
