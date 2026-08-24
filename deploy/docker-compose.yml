@@ -15,7 +15,7 @@ services:
     ports:
       - "127.0.0.1:19086:8080"
     networks:
-      - metapi
+      - check-in-runtime
     volumes:
       - ./data:/data
       - /etc/resin-egress-gateway/gateway.token:/run/secrets/gateway.token:ro
@@ -45,6 +45,6 @@ services:
       - "com.centurylinklabs.watchtower.enable=true"
 
 networks:
-  metapi:
+  check-in-runtime:
     external: true
-    name: metapi-deploy_default
+    name: metapi-check-in-runtime
