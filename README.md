@@ -26,11 +26,16 @@
 | `Proxy-Authorization: Bearer <token>` | Gateway 内部鉴权；不会发往目标站点 |
 | `X-Egress-Target` | 完整目标 URL 的 base64url（无 padding）编码 |
 | `X-Egress-Key` | 稳定业务身份，例如应用名 + 账号 ID |
+| `X-Egress-TLS-Profile` | 可选的账号传输配置 `v1:<0..103679>:<64 位小写 SHA256>`；版本化入口必填 |
 | `X-Egress-Retry-Mode` | `never`、`transport`、`safe` 或 `auto` |
 | `X-Egress-Response-Header-Timeout-Ms` | 可选，1 秒到 10 分钟 |
 | `X-Egress-First-Byte-Timeout-Ms` | 可选，1 秒到 10 分钟 |
 
 响应会增加 `X-Egress-Attempts` 与 `X-Egress-Generation`。Gateway 控制头和 `X-Resin-Account` 均不会泄漏给目标站点。
+
+需要逐账号 TLS 的客户端调用 `/v1/forward/tls-v1`。该入口强制校验 profile，
+并在 Resin 确认后回传 `X-Egress-TLS-Profile`。响应回执表示选择了账号传输配置；
+普通 HTTP 只有连接池隔离，不会因此变成 HTTPS。无回执不触发 POST 重放。
 
 `transport` 覆盖网络错误、Resin `UPSTREAM_*`、`NO_AVAILABLE_NODES`、响应头/首字节超时和响应提交前的 body reset。`safe` 另外覆盖 HTTP 408、425、429、500、502、503、504，并对 `Retry-After` 做最多 3 秒的有界等待。
 
@@ -44,6 +49,15 @@ X-Resin-Account: egw-<route-hash>-g<generation>
 ```
 
 Resin reverse-proxy 每次只选择一个 sticky identity。Gateway 的三次 generation 正好形成最多三个新的 L7 尝试，不会与 CONNECT 内部三节点重试形成 3x3 放大。
+
+携带 profile 时，协议段改为 `https+tls-v1` 或 `http+tls-v1`，并传递
+`X-Resin-TLS-Profile`。新版 Resin 校验并剥离控制头，目标 HTTPS 握手使用 uTLS 账号配置；
+旧 Resin 会在路由前拒绝不支持的 protocol，旧 Gateway 则不接受版本化入口。
+因此组件版本不匹配时不会先用默认 TLS 发出业务请求。升级顺序为 Resin、Gateway、调用方。
+
+generation 改变出口粘性身份，不改变显式 TLS profile。目标 TLS 连接池由 Resin 按
+node/platform/account/profile 分离；账号 uTLS 路径当前使用 HTTP/1.1，不宣称 HTTP/2 指纹伪装。
+Node 到本服务、以及本服务到 Resin 的内部控制连接不等于目标站点 TLS 握手。
 
 ## 配置
 

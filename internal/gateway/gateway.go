@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -31,6 +32,8 @@ const (
 	attemptsResponseHeader   = "X-Egress-Attempts"
 	generationResponseHeader = "X-Egress-Generation"
 	resinAccountHeader       = "X-Resin-Account"
+	tlsProfileHeader         = "X-Egress-TLS-Profile"
+	resinTLSProfileHeader    = "X-Resin-TLS-Profile"
 	resinErrorHeader         = "X-Resin-Error"
 	maxTargetHeaderBytes     = 16 << 10
 	defaultMaxInFlight       = 4
@@ -38,6 +41,17 @@ const (
 	defaultBufferTimeout     = 2 * time.Minute
 	targetLookupTimeout      = 2 * time.Second
 )
+
+var tlsProfilePattern = regexp.MustCompile(`^v1:(0|[1-9][0-9]{0,5}):[a-f0-9]{64}$`)
+
+func validTLSProfile(value string) bool {
+	match := tlsProfilePattern.FindStringSubmatch(value)
+	if match == nil {
+		return false
+	}
+	index, _ := strconv.Atoi(match[1])
+	return index < 103680
+}
 
 type retryMode uint8
 
@@ -109,6 +123,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	mux.HandleFunc("GET /metrics", g.handleMetrics)
 	mux.HandleFunc("/v1/forward", g.handleForward)
+	mux.HandleFunc("/v1/forward/tls-v1", g.handleForward)
 	return mux
 }
 
@@ -170,6 +185,11 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 	if routeKey == "" || len(routeKey) > 1024 {
 		g.metrics.targetRejected.Add(1)
 		http.Error(w, "missing or invalid egress key", http.StatusBadRequest)
+		return
+	}
+	profile := r.Header.Get(tlsProfileHeader)
+	if (r.URL.Path == "/v1/forward/tls-v1" || profile != "") && !validTLSProfile(profile) {
+		http.Error(w, "invalid account TLS profile", http.StatusBadRequest)
 		return
 	}
 	body, err := readBoundedBody(r.Body, g.cfg.MaxRequestBodyBytes)
@@ -296,7 +316,8 @@ type attemptResult struct {
 func (g *Gateway) performAttempt(parent context.Context, method string, inboundHeaders http.Header, body []byte, target *url.URL, identity string, mode retryMode, headerTimeout, firstByteTimeout time.Duration) attemptResult {
 	ctx, cancel := context.WithCancel(parent)
 	result := attemptResult{cancel: cancel}
-	upstreamURL := g.buildResinURL(target)
+	profile := inboundHeaders.Get(tlsProfileHeader)
+	upstreamURL := g.buildResinURL(target, profile != "")
 	req, err := http.NewRequestWithContext(ctx, method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		result.err = err
@@ -304,6 +325,9 @@ func (g *Gateway) performAttempt(parent context.Context, method string, inboundH
 	}
 	copyRequestHeaders(req.Header, inboundHeaders)
 	req.Header.Set(resinAccountHeader, identity)
+	if profile != "" {
+		req.Header.Set(resinTLSProfileHeader, profile)
+	}
 	resp, err := g.doWithHeaderTimeout(ctx, cancel, req, headerTimeout)
 	if err != nil {
 		result.err = err
@@ -316,6 +340,14 @@ func (g *Gateway) performAttempt(parent context.Context, method string, inboundH
 	if resinCode := strings.ToUpper(strings.TrimSpace(resp.Header.Get(resinErrorHeader))); resinCode != "" {
 		result.retry = mode != retryNever && isRetryableResinError(resinCode)
 		result.reason = "resin_" + strings.ToLower(resinCode)
+		return result
+	}
+	if profile != "" && resp.Header.Get(resinTLSProfileHeader) != profile {
+		// A completed POST must not be replayed merely because an older Resin
+		// does not acknowledge the requested TLS profile.
+		resp.Body.Close()
+		result.response = nil
+		result.err = errors.New("Resin did not apply the account TLS profile")
 		return result
 	}
 	if mode == retrySafe && isRetryableStatus(resp.StatusCode) {
@@ -396,6 +428,9 @@ func closeLateResponse(results <-chan responseResult) {
 
 func (g *Gateway) deliverResponse(w http.ResponseWriter, resp *http.Response, firstChunk, bufferedBody []byte, streaming bool, attempts int, generation uint64) error {
 	copyResponseHeaders(w.Header(), resp.Header)
+	if profile := resp.Header.Get(resinTLSProfileHeader); validTLSProfile(profile) {
+		w.Header().Set(tlsProfileHeader, profile)
+	}
 	w.Header().Set(attemptsResponseHeader, strconv.Itoa(attempts))
 	w.Header().Set(generationResponseHeader, strconv.FormatUint(generation, 10))
 	w.WriteHeader(resp.StatusCode)
@@ -513,13 +548,18 @@ func (g *Gateway) release() {
 	<-g.inFlight
 }
 
-func (g *Gateway) buildResinURL(target *url.URL) string {
+func (g *Gateway) buildResinURL(target *url.URL, accountTLS bool) string {
 	base := strings.TrimSuffix(g.cfg.ResinBaseURL.String(), "/")
 	path := target.EscapedPath()
 	if path == "" {
 		path = "/"
 	}
-	result := base + "/" + url.PathEscape(g.cfg.ResinProxyToken) + "/" + url.PathEscape(g.cfg.ResinPlatform) + "/" + target.Scheme + "/" + url.PathEscape(target.Host) + path
+	protocol := target.Scheme
+	if accountTLS {
+		// Older Resin rejects this protocol before it can forward credentials.
+		protocol += "+tls-v1"
+	}
+	result := base + "/" + url.PathEscape(g.cfg.ResinProxyToken) + "/" + url.PathEscape(g.cfg.ResinPlatform) + "/" + protocol + "/" + url.PathEscape(target.Host) + path
 	if target.RawQuery != "" {
 		result += "?" + target.RawQuery
 	}
