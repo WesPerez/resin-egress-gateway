@@ -124,6 +124,8 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("GET /metrics", g.handleMetrics)
 	mux.HandleFunc("/v1/forward", g.handleForward)
 	mux.HandleFunc("/v1/forward/tls-v1", g.handleForward)
+	mux.HandleFunc("GET /v1/route/device-v2", g.handleDeviceRoute)
+	mux.HandleFunc("POST /v1/route/device-v2/feedback", g.handleDeviceRoute)
 	return mux
 }
 

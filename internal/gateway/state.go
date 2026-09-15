@@ -69,6 +69,26 @@ func (s *StateStore) Advance(route string, attempted uint64) (uint64, error) {
 	return entry.Generation, s.saveLocked()
 }
 
+func (s *StateStore) CompareAndAdvance(route string, expected uint64) (uint64, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, exists := s.routes[route]
+	if entry.Generation != expected {
+		return entry.Generation, false, nil
+	}
+	next := routeState{Generation: expected + 1, LastUsed: s.now().UTC()}
+	s.routes[route] = next
+	if err := s.saveLocked(); err != nil {
+		if exists {
+			s.routes[route] = entry
+		} else {
+			delete(s.routes, route)
+		}
+		return entry.Generation, false, err
+	}
+	return next.Generation, true, nil
+}
+
 func (s *StateStore) Touch(route string, generation uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
