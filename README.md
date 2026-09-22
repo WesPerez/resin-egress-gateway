@@ -36,6 +36,19 @@
 
 ## Resin 接入
 
+### 读取已有路由的代次
+
+应用需要让按需浏览器使用已有 CONNECT 身份时，调用 `POST /v1/routes/generation`，
+沿用 `Proxy-Authorization: Bearer <token>`，JSON 为
+`{"key":"AppsGlobal.metapi-account-42","origin":"https://example.com"}`。
+成功只返回 `{"generation":3}`；不存在或过期返回 404，认证失败返回 401，参数错误返回 400。
+调用方必须在失败时停止该次操作，不能猜测代次或回退读取 Gateway 的 `state.json`。
+
+此端点只读：不刷新 TTL、不创建或轮换路由、不请求 DNS/Resin/上游；请求体上限 4 KiB。
+key 位于请求体，不能放进访问日志的 URL；响应禁止缓存。不返回出口、节点、凭据或全量路由。
+它沿用内部转发服务的信任边界（同一令牌可转发任意允许的目标），不提供多租户权限隔离；
+不要把该令牌交给浏览器页面或公开客户端。地址与令牌文件由调用方配置，数据文件仅由 Gateway 持有。
+
 Gateway 使用 Resin 官方 reverse-proxy 协议：
 
 ```text

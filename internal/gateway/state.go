@@ -54,6 +54,17 @@ func (s *StateStore) Current(route string) (uint64, error) {
 	return entry.Generation, s.saveLocked()
 }
 
+// Peek observes a live route without extending its lifetime or writing state.
+func (s *StateStore) Peek(route string) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.routes[route]
+	if !ok || (!entry.LastUsed.IsZero() && entry.LastUsed.Before(s.now().UTC().Add(-s.ttl))) {
+		return 0, false
+	}
+	return entry.Generation, true
+}
+
 func (s *StateStore) Advance(route string, attempted uint64) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

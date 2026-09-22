@@ -108,6 +108,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	mux.HandleFunc("GET /metrics", g.handleMetrics)
+	mux.HandleFunc("POST /v1/routes/generation", g.handleRouteGeneration)
 	mux.HandleFunc("/v1/forward", g.handleForward)
 	return mux
 }
