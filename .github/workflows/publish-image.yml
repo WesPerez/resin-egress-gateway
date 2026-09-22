@@ -15,6 +15,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  CI_FALLBACK_CONTRACT: '1'
+  CI_FALLBACK_PR_SKIPPED_JOBS: '["publish"]'
+  CI_FALLBACK_SKIP_RULES: '[{"event":"workflow_dispatch","except_refs":["refs/heads/main"],"jobs":["publish"]}]'
+  SOURCE_REPOSITORY: ${{ vars.CI_PRIMARY_REPOSITORY || github.repository }}
   IMAGE_NAME: ghcr.io/wesperez/resin-egress-gateway
 
 jobs:
@@ -34,7 +38,7 @@ jobs:
         run: go test -race -count=1 -shuffle=on ./...
 
   publish:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: (vars.CI_SOURCE_EVENT || github.event_name) != 'pull_request' && (vars.CI_SOURCE_REF || github.ref) == 'refs/heads/main'
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -43,14 +47,18 @@ jobs:
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ vars.CI_PRIMARY_OWNER || github.repository_owner }}
+          password: ${{ secrets.CI_PUBLISH_TOKEN || secrets.GITHUB_TOKEN }}
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         id: meta
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: type=sha,format=long,prefix=sha-
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.SOURCE_REPOSITORY }}
+            org.opencontainers.image.revision=${{ github.sha }}
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        id: image
         with:
           context: .
           file: Dockerfile
@@ -66,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          current_head="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+          current_head="$(git ls-remote "https://github.com/${SOURCE_REPOSITORY}.git" refs/heads/main | awk '{print $1}')"
           if [[ "$current_head" == "$GITHUB_SHA" ]]; then
             echo 'promote=true' >>"$GITHUB_OUTPUT"
           else
@@ -78,3 +86,21 @@ jobs:
           docker buildx imagetools create
           --tag "${IMAGE_NAME}:main"
           "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+
+      - name: Record published image
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          digest = os.environ['IMAGE_DIGEST']
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', digest)
+          with open('image-metadata.json', 'w') as output:
+              json.dump({'repository': os.environ['SOURCE_REPOSITORY'], 'revision': os.environ['GITHUB_SHA'], 'image': os.environ['IMAGE_NAME'], 'digest': digest}, output)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-metadata
+          path: image-metadata.json
+          if-no-files-found: error
