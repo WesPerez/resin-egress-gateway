@@ -92,3 +92,7 @@ test -z "$(gofmt -l cmd internal)"
 ```
 
 GitHub Actions 在 `main` 上完成格式、vet、race tests 和镜像构建，先发布不可变 `sha-<commit>`，确认远端 `main` 未变化后再提升 `main` 标签。
+
+## 生产服务器维护
+
+本服务器禁止下载项目依赖和构建；提交后由 GitHub-hosted CI 验证并发布，生产仅拉取已验证产物。日志、恢复点和临时工作树按 [AGENTS.md](AGENTS.md) 收尾。
