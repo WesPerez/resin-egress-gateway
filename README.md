@@ -1,14 +1,14 @@
 # Resin Egress Gateway
 
-`resin-egress-gateway` 是一个小型、受信任的内部 L7 出站恢复服务。它在调用方与 Resin 之间缓存一次请求，并只在响应尚未提交给调用方时，使用新的 Resin 粘性身份重放请求。
+`resin-egress-gateway` 是一个小型、受信任的内部 L7 出站恢复服务。它在调用方与 Resin 之间缓存一次请求，并只在响应尚未提交给调用方时，在原账号租约上条件恢复出口后重放请求。
 
 它解决 Resin 无法解决的那一段：CONNECT/TLS 已经建立，但业务请求随后遇到响应头超时、首字节超时、连接重置或临时 HTTP 错误。Resin 继续负责节点池、路由、lease 和健康状态；Gateway 不采集节点、不管理模型账号，也不提供直连兜底。
 
 ## 边界
 
-- 总计默认最多 3 次尝试，每次失败推进一个持久化 `generation`，成功身份会被后续请求继续使用。
+- 总计默认最多 3 次尝试，业务账号身份保持不变；真实传输失败通过 Resin acquire/report-failure 的 CAS 接口更换原租约出口。
 - 请求体默认最多 8 MiB，普通响应默认在 8 MiB 内完整缓冲；超过上限的响应转为流式透传。
-- 普通响应首字后最多缓冲 2 分钟；超时发生在下游尚未提交响应时，可按所选 retry mode 换身份重试。
+- 普通响应首字后最多缓冲 2 分钟；超时发生在下游尚未提交响应时，可按所选 retry mode 在原账号上恢复重试。
 - 默认最多同时处理 4 个请求；额外请求最多排队 30 秒，避免请求与响应缓冲耗尽容器内存。
 - SSE、NDJSON 和 JSON sequence 只等待首个 body 字节。首字一旦写给调用方，后续中断不会重放。
 - 默认策略：GET/HEAD/OPTIONS/PUT/DELETE 或携带 `Idempotency-Key` 的请求可对临时状态码重试；其他非幂等请求默认不重试。
@@ -41,7 +41,7 @@
 应用需要让按需浏览器使用已有 CONNECT 身份时，调用 `POST /v1/routes/generation`，
 沿用 `Proxy-Authorization: Bearer <token>`，JSON 为
 `{"key":"AppsGlobal.metapi-account-42","origin":"https://example.com"}`。
-成功只返回 `{"generation":3}`；不存在或过期返回 404，认证失败返回 401，参数错误返回 400。
+默认返回 `{"generation":3,"identity_version":2,"account":"metapi-account-42"}`；不存在或过期返回 404，认证失败返回 401，参数错误返回 400。
 调用方必须在失败时停止该次操作，不能猜测代次或回退读取 Gateway 的 `state.json`。
 
 此端点只读：不刷新 TTL、不创建或轮换路由、不请求 DNS/Resin/上游；请求体上限 4 KiB。
@@ -53,10 +53,10 @@ Gateway 使用 Resin 官方 reverse-proxy 协议：
 
 ```text
 http://resin-host:10834/<proxy-token>/<platform>/<scheme>/<target-host>/<path>
-X-Resin-Account: egw-<route-hash>-g<generation>
+X-Resin-Account: <stable-account>~r1~<observed-lease-guard>
 ```
 
-Resin reverse-proxy 每次只选择一个 sticky identity。Gateway 的三次 generation 正好形成最多三个新的 L7 尝试，不会与 CONNECT 内部三节点重试形成 3x3 放大。
+每次转发先取得原账号租约快照，再使用受约束身份固定该次出口；并发旧失败无法改写新租约。`AppsGlobal.<account>` 复用业务账号，其他 key 使用与目标域名无关的稳定哈希。HTTP 限流及站点错误不换 IP；证书错误返回明确原因并对站点冷却 5 分钟。`generation` 仅用于重试观测，不再派生租约。旧模式仅供显式回滚（`STABLE_ACCOUNTS=false`）。
 
 ## 配置
 
@@ -67,6 +67,7 @@ Resin reverse-proxy 每次只选择一个 sticky identity。Gateway 的三次 ge
 | `RESIN_BASE_URL` | `http://proxy.internal:10834` |
 | `RESIN_PROXY_TOKEN_FILE` | 必填 |
 | `RESIN_PLATFORM` | `AppsGlobal` |
+| `STABLE_ACCOUNTS` | `true` |
 | `STATE_PATH` | `/data/state.json` |
 | `MAX_ATTEMPTS` | `3` |
 | `MAX_IN_FLIGHT` | `4` |

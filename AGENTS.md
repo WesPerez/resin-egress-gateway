@@ -12,7 +12,7 @@
 
 - 默认使用中文维护文档，代码标识符与协议字段保持英文。
 - 本项目只负责受信任内部客户端的 L7 出站恢复；不得加入 TLS MITM、直连兜底、节点采集、账号调度或模型语义转换。
-- Resin 节点池与 lease 仍由 Resin 管理。Gateway 只通过官方 reverse-proxy 协议派生稳定身份并在响应提交前轮换 generation。
+- Resin 节点池与 lease 仍由 Resin 管理。Gateway 使用稳定业务身份，通过代理凭据认证的 acquire/report-failure 接口条件恢复；重试不得新增账号身份，响应提交后不重放。
 - 非幂等请求默认不重放；只有调用方显式选择 `transport`/`safe` 或携带幂等键时才扩大重试范围。
 - 一旦向下游提交响应头或响应体，禁止重放。SSE、NDJSON 和其他流式响应必须遵守该边界。
 - 不记录请求头、Cookie、Authorization、完整 URL query、请求体或响应体。
