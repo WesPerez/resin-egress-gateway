@@ -46,6 +46,10 @@ func (g *Gateway) handleRouteGeneration(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if g.cfg.StableAccounts {
+		_ = json.NewEncoder(w).Encode(map[string]any{"generation": generation, "identity_version": 2, "account": g.stableIdentity(input.Key)})
+		return
+	}
 	_ = json.NewEncoder(w).Encode(struct {
 		Generation uint64 `json:"generation"`
 	}{generation})

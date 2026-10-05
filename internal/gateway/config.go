@@ -34,6 +34,7 @@ type Config struct {
 	RouteStateTTL         time.Duration
 	AllowHTTP             bool
 	AllowPrivateTargets   bool
+	StableAccounts        bool
 }
 
 func LoadConfig() (Config, error) {
@@ -74,6 +75,7 @@ func LoadConfig() (Config, error) {
 		RouteStateTTL:         envDuration("ROUTE_STATE_TTL", 30*24*time.Hour),
 		AllowHTTP:             envBool("ALLOW_HTTP_TARGETS", false),
 		AllowPrivateTargets:   envBool("ALLOW_PRIVATE_TARGETS", false),
+		StableAccounts:        envBool("STABLE_ACCOUNTS", true),
 	}
 	if strings.TrimSpace(cfg.ResinPlatform) == "" || strings.ContainsAny(cfg.ResinPlatform, ".:|/\\@?#%~ \t\r\n") {
 		return Config{}, fmt.Errorf("RESIN_PLATFORM is invalid")

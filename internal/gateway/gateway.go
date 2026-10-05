@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -59,13 +60,15 @@ type Metrics struct {
 }
 
 type Gateway struct {
-	cfg      Config
-	state    *StateStore
-	client   *http.Client
-	logger   *slog.Logger
-	inFlight chan struct{}
-	lookupIP func(context.Context, string) ([]netip.Addr, error)
-	metrics  Metrics
+	cfg       Config
+	state     *StateStore
+	client    *http.Client
+	logger    *slog.Logger
+	inFlight  chan struct{}
+	lookupIP  func(context.Context, string) ([]netip.Addr, error)
+	metrics   Metrics
+	siteMu    sync.Mutex
+	sitePause map[string]time.Time
 }
 
 func New(cfg Config, state *StateStore, logger *slog.Logger) *Gateway {
@@ -93,11 +96,12 @@ func New(cfg Config, state *StateStore, logger *slog.Logger) *Gateway {
 		cfg.ResponseBufferTimeout = defaultBufferTimeout
 	}
 	return &Gateway{
-		cfg:      cfg,
-		state:    state,
-		client:   &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		logger:   logger,
-		inFlight: make(chan struct{}, cfg.MaxInFlight),
+		cfg:       cfg,
+		state:     state,
+		client:    &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		logger:    logger,
+		inFlight:  make(chan struct{}, cfg.MaxInFlight),
+		sitePause: make(map[string]time.Time),
 		lookupIP: func(ctx context.Context, host string) ([]netip.Addr, error) {
 			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 		},
@@ -201,6 +205,13 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 
 	routeID := routeHash(routeKey, target)
+	if g.sitePaused(target) {
+		g.metrics.failures.Add(1)
+		w.Header().Set("Retry-After", "300")
+		w.Header().Set(resinErrorHeader, "UPSTREAM_TLS_CERTIFICATE_ERROR")
+		g.writeGatewayError(w, http.StatusBadGateway, "UPSTREAM_TLS_CERTIFICATE_ERROR: upstream certificate verification is cooling down", 0, 0)
+		return
+	}
 	generation, err := g.state.Current(routeID)
 	if err != nil {
 		g.writeGatewayError(w, http.StatusInternalServerError, "state unavailable", 0, generation)
@@ -223,7 +234,33 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 		}
 		attemptsUsed = attempt
 		identity := resinIdentity(routeID, generation)
-		result := g.performAttempt(r.Context(), r.Method, r.Header, body, target, identity, mode, headerTimeout, firstByteTimeout)
+		var observed *recoveryLease
+		if g.cfg.StableAccounts {
+			identity = g.stableIdentity(routeKey)
+			lease, acquireErr := g.acquireLease(r.Context(), identity, target)
+			if acquireErr != nil {
+				finalErr = acquireErr
+				break
+			}
+			observed = lease
+		}
+		requestIdentity := identity
+		if observed != nil {
+			requestIdentity = observed.guardedIdentity()
+		}
+		result := g.performAttempt(r.Context(), r.Method, r.Header, body, target, requestIdentity, mode, headerTimeout, firstByteTimeout)
+		if result.reason == "resin_upstream_tls_certificate_error" {
+			g.pauseSite(target)
+			if result.response != nil {
+				result.response.Body.Close()
+			}
+			result.cancel()
+			g.metrics.failures.Add(1)
+			w.Header().Set("Retry-After", "300")
+			g.writeGatewayError(w, http.StatusBadGateway, "UPSTREAM_TLS_CERTIFICATE_ERROR: upstream certificate verification failed", attempt, generation)
+			g.logger.Warn("upstream certificate rejected", "host", target.Hostname(), "attempts", attempt)
+			return
+		}
 		if result.response != nil && !result.retry {
 			err = g.deliverResponse(w, result.response, result.firstChunk, result.bufferedBody, result.streaming, attempt, generation)
 			result.cancel()
@@ -250,6 +287,13 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 		result.cancel()
 		if !result.retry || mode == retryNever {
 			break
+		}
+		if g.cfg.StableAccounts && shouldRecover(result.reason) {
+			// Retry only after an observed lease has been conditionally recovered.
+			// Old failures cannot rotate a newer lease; Resin owns the shared limits.
+			if observed == nil || g.recoverLease(r.Context(), identity, target, observed, result.reason) != nil {
+				break
+			}
 		}
 		if attempt >= maxAttempts {
 			if next, advanceErr := g.state.Advance(routeID, generation); advanceErr == nil {
@@ -317,6 +361,8 @@ func (g *Gateway) performAttempt(parent context.Context, method string, inboundH
 	if resinCode := strings.ToUpper(strings.TrimSpace(resp.Header.Get(resinErrorHeader))); resinCode != "" {
 		result.retry = mode != retryNever && isRetryableResinError(resinCode)
 		result.reason = "resin_" + strings.ToLower(resinCode)
+		// Non-retryable proxy failures still need their diagnostic body delivered.
+		result.streaming = !result.retry
 		return result
 	}
 	if mode == retrySafe && isRetryableStatus(resp.StatusCode) {
@@ -605,7 +651,7 @@ func isRetryableStatus(status int) bool {
 
 func isRetryableResinError(code string) bool {
 	switch code {
-	case "NO_AVAILABLE_NODES", "UPSTREAM_CONNECT_FAILED", "UPSTREAM_TIMEOUT", "UPSTREAM_REQUEST_FAILED", "INTERNAL_ERROR":
+	case "LEASE_GUARD_FAILED", "NO_AVAILABLE_NODES", "UPSTREAM_CONNECT_FAILED", "UPSTREAM_TIMEOUT", "UPSTREAM_REQUEST_FAILED", "INTERNAL_ERROR":
 		return true
 	default:
 		return false
